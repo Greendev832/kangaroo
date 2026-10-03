@@ -7,7 +7,9 @@ use k256::elliptic_curve::ops::Reduce;
 use k256::{ProjectivePoint, Scalar, U256 as K256U256};
 use std::collections::HashMap;
 
-const MAX_DISTINGUISHED_POINTS: usize = 65_536;
+/// A solve stores ~K * 2^(range/2 - dp_bits) DPs, and `auto_dp_bits` keeps that at
+/// ~K * 2^18. This leaves room for unlucky runs up to K = 16. Roughly 150 bytes per entry.
+const MAX_DISTINGUISHED_POINTS: usize = 1 << 22;
 
 /// SCALAR_HALF = (n+1)/2 where n is secp256k1 order
 /// Property: 2 × SCALAR_HALF ≡ 1 (mod n)
@@ -38,6 +40,7 @@ pub struct DPTable {
     tame_count: usize,
     wild1_count: usize,
     wild2_count: usize,
+    full_warned: bool,
 }
 
 impl DPTable {
@@ -51,7 +54,24 @@ impl DPTable {
             tame_count: 0,
             wild1_count: 0,
             wild2_count: 0,
+            full_warned: false,
         }
+    }
+
+    /// Returns true if there is room for another DP, warning once when there isn't.
+    fn has_room(&mut self) -> bool {
+        if self.total_dps < MAX_DISTINGUISHED_POINTS {
+            return true;
+        }
+        if !self.full_warned {
+            self.full_warned = true;
+            tracing::warn!(
+                "DP table full ({} entries): new DPs are only checked, not stored. \
+                 Increase --dp-bits for this range.",
+                MAX_DISTINGUISHED_POINTS
+            );
+        }
+        false
     }
 
     /// Insert DP and check for collision
@@ -97,6 +117,8 @@ impl DPTable {
             affine_x[6],
             affine_x[7],
         ]);
+
+        let has_room = self.has_room();
 
         // Check for existing DPs with same hash
         if let Some(existing_list) = self.table.get_mut(&hash_key) {
@@ -158,7 +180,7 @@ impl DPTable {
                 return None;
             }
             // No collision, add to list
-            if self.total_dps >= MAX_DISTINGUISHED_POINTS {
+            if !has_room {
                 return None;
             }
             existing_list.push(StoredDP {
@@ -169,7 +191,7 @@ impl DPTable {
             self.total_dps += 1;
             self.increment_type_counter(dp.ktype);
         } else {
-            if self.total_dps >= MAX_DISTINGUISHED_POINTS {
+            if !has_room {
                 return None;
             }
             // New hash key

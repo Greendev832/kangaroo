@@ -24,12 +24,14 @@ struct Kangaroo {
     ktype: u32,
     is_active: u32,
     cycle_counter: u32,
-    repeat_count: u32,
+    checkpoint_x: u32,
     last_jump: u32,
     _padding: array<u32, 3>
 }
 
-const REPEAT_THRESHOLD: u32 = 3u;
+// Must match RESPAWN_FLAG in src/gpu/mod.rs
+const RESPAWN_FLAG: u32 = 0x100u;
+const CHECKPOINT_INTERVAL_MASK: u32 = 63u;
 
 struct DistinguishedPoint {
     x: array<u32, 8>,
@@ -61,18 +63,22 @@ override WORKGROUP_SIZE: u32 = 128u;
 // Store distinguished point
 // -----------------------------------------------------------------------------
 
-fn store_dp(k: Kangaroo, kangaroo_id: u32) {
+// Returns false if the buffer was full; the caller must then keep the kangaroo
+// active, otherwise it would never be respawned.
+fn store_dp(k: Kangaroo, kangaroo_id: u32, flags: u32) -> bool {
     let idx = atomicAdd(&dp_count, 1u);
 
     if (idx < 65536u) {
         var dp: DistinguishedPoint;
         dp.x = k.x;
         dp.dist = k.dist;
-        dp.ktype = k.ktype;
+        dp.ktype = k.ktype | flags;
         dp.kangaroo_id = kangaroo_id;
         dp._padding = array<u32, 6>(0u, 0u, 0u, 0u, 0u, 0u);
         dp_buffer[idx] = dp;
+        return true;
     }
+    return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -139,16 +145,6 @@ fn jump_index_from_x(px: array<u32, 8>) -> u32 {
     return (mixed >> 24u) & 0xFFu;
 }
 
-fn escape_index_from_state(px: array<u32, 8>, kid: u32, cycle_counter: u32, step: u32) -> u32 {
-    let seed = px[0]
-        ^ px[2]
-        ^ (kid * 0x85ebca6bu)
-        ^ (cycle_counter * 0xc2b2ae35u)
-        ^ step;
-    let mixed = seed * 0x27d4eb2du;
-    return (mixed >> 24u) & 0xFFu;
-}
-
 // -----------------------------------------------------------------------------
 // Main compute shader
 // -----------------------------------------------------------------------------
@@ -181,34 +177,31 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invo
         py = fe_one();
     }
 
-    // Track if we already stored a DP this batch
-    var dp_stored = false;
+    // A walk ends at its first DP (or when it is found stuck). The kangaroo then
+    // stops until the CPU respawns it at a fresh random position, so walks never
+    // stay merged and duplicate each other's work.
+    var walking = valid;
 
-    // Check current position once before the walk.
-    // Subsequent checks are done after each successful jump.
-    if (valid && is_distinguished(px)) {
+    // A freshly spawned kangaroo may already sit on a DP.
+    if (walking && is_distinguished(px)) {
         k.x = px;
         k.y = py;
-        store_dp(k, kid);
-        dp_stored = true;
+        if (store_dp(k, kid, 0u)) {
+            k.is_active = 0u;
+            walking = false;
+        }
     }
 
     // Perform jumps
     for (var step = 0u; step < config.steps_per_call; step++) {
+        // The next jump depends only on the point (plus the no-immediate-repeat rule),
+        // so two walks that meet follow the same path until they reach the same DP.
         var effective_jump_idx = jump_index_from_x(px);
-        if (valid) {
-            let in_cycle = (k.cycle_counter > config.cycle_cap)
-                || ((k.repeat_count & 0xFFFFu) > REPEAT_THRESHOLD);
-            if (in_cycle) {
-                effective_jump_idx = escape_index_from_state(px, kid, k.cycle_counter, step);
-                k.cycle_counter = 0u;
-                k.repeat_count = 0u;
-            } else {
-                if (effective_jump_idx == k.last_jump) {
-                    effective_jump_idx = (effective_jump_idx + 1u) & 0xFFu;
-                }
-                k.last_jump = effective_jump_idx;
+        if (walking) {
+            if (effective_jump_idx == k.last_jump) {
+                effective_jump_idx = (effective_jump_idx + 1u) & 0xFFu;
             }
+            k.last_jump = effective_jump_idx;
         }
         let jump_idx = effective_jump_idx;
         let jump_point = jump_points[jump_idx];
@@ -398,7 +391,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invo
         // POINT ADDITION AND DP CHECK
         // =====================================================================
 
-        if (valid) {
+        if (walking) {
             // Skip if dx was zero (point collision - astronomically unlikely)
             if (!dx_was_zero) {
                 let y_odd = (py[0] & 1u) != 0u;
@@ -420,21 +413,25 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(local_invo
                 }
 
                 k.cycle_counter = k.cycle_counter + 1u;
-                let new_jump = px[0] & 0xFFFFu;
-                if (new_jump == (k.repeat_count >> 16u)) {
-                    let cnt = (k.repeat_count & 0xFFFFu) + 1u;
-                    k.repeat_count = (new_jump << 16u) | cnt;
-                } else {
-                    k.repeat_count = (new_jump << 16u) | 1u;
-                }
 
-                if (!dp_stored) {
-                    if (is_distinguished(px)) {
-                        k.x = px;
-                        k.y = py;
-                        store_dp(k, kid);
-                        dp_stored = true;
+                if (is_distinguished(px)) {
+                    k.x = px;
+                    k.y = py;
+                    if (store_dp(k, kid, 0u)) {
+                        k.is_active = 0u;
+                        walking = false;
                     }
+                } else if (px[0] == k.checkpoint_x || k.cycle_counter > config.cycle_cap) {
+                    // Back at the checkpoint: a fruitless cycle the negation map can
+                    // create. The cap catches the rare cycle longer than the interval.
+                    k.x = px;
+                    k.y = py;
+                    if (store_dp(k, kid, RESPAWN_FLAG)) {
+                        k.is_active = 0u;
+                        walking = false;
+                    }
+                } else if ((k.cycle_counter & CHECKPOINT_INTERVAL_MASK) == 0u) {
+                    k.checkpoint_x = px[0];
                 }
             }
         }

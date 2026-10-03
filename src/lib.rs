@@ -52,6 +52,10 @@ pub struct Args {
     #[arg(short, long)]
     pubkey: Option<String>,
 
+    /// Signature r value: x-coordinate of R = k*G (32-byte hex), alternative to --pubkey
+    #[arg(long, conflicts_with = "pubkey")]
+    r: Option<String>,
+
     /// Start of search range (hex, without 0x prefix)
     #[arg(short, long)]
     start: Option<String>,
@@ -169,9 +173,23 @@ fn resolve_params(args: &Args) -> anyhow::Result<ResolvedParams> {
         None
     };
 
+    let target_arg = match &args.r {
+        Some(r) => {
+            let r = r.trim_start_matches("0x");
+            if r.len() != 64 || !r.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(anyhow!(
+                    "--r must be exactly 64 hex characters (32-byte x-coordinate), got {}",
+                    r.len()
+                ));
+            }
+            Some(r.to_string())
+        }
+        None => args.pubkey.clone(),
+    };
+
     let (pubkey_str, start_str, range_bits) = match provider_result {
         Some(ref pr) => {
-            let pubkey_str = match (&args.pubkey, &pr.pubkey) {
+            let pubkey_str = match (&target_arg, &pr.pubkey) {
                 (Some(p), _) => p.clone(),
                 (None, Some(p)) => p.clone(),
                 (None, None) => {
@@ -203,10 +221,8 @@ fn resolve_params(args: &Args) -> anyhow::Result<ResolvedParams> {
             (pubkey_str, start_str, range_bits)
         }
         None => {
-            let pubkey_str = args
-                .pubkey
-                .clone()
-                .ok_or_else(|| anyhow!("--pubkey is required when not using --target"))?;
+            let pubkey_str = target_arg
+                .ok_or_else(|| anyhow!("--pubkey or --r is required when not using --target"))?;
             let start_str = args.start.clone().unwrap_or_else(|| "0".to_string());
             let range_bits = args.range.unwrap_or(32);
             (pubkey_str, start_str, range_bits)
@@ -484,12 +500,49 @@ fn gpu_weight_for_device_type(device_type: wgpu::DeviceType) -> u32 {
     }
 }
 
+/// Fewest kangaroos worth launching: three sets of one 128-thread workgroup each.
+const MIN_AUTO_KANGAROOS: u32 = 384;
+
+/// Ranges below this solve in about a second, so they may use very short walks.
+const SMALL_RANGE_BITS: u32 = 44;
+
+/// Kangaroo count for a range, capped so the herd's unfinished walks stay small.
+///
+/// When the key is found, every other kangaroo is part-way through a walk of
+/// ~2^dp_bits steps. With dp_bits >= 8, keeping kangaroos <= 2^(range/2 - 8) bounds
+/// that leftover work by the expected sqrt(N) solve cost.
+///
+/// Each step is latency-bound (the workgroup waits on one field inversion), so a GPU
+/// runs up to ~1/8 of its optimal herd in the same time per step as a single
+/// workgroup. The herd never shrinks below that, as the extra kangaroos are free.
 pub(crate) fn recommended_auto_kangaroos(optimal_k: u32, range_bits: u32) -> u32 {
-    if range_bits <= 40 {
-        optimal_k.min(32_768)
-    } else {
-        optimal_k
-    }
+    let cap_bits = (range_bits / 2).saturating_sub(8).min(31);
+    let latency_floor = (optimal_k / 8).max(MIN_AUTO_KANGAROOS);
+    optimal_k.min(1u32 << cap_bits).max(latency_floor)
+}
+
+/// Mean solve cost in units of sqrt(N), measured over random keys at 40-60 bits.
+/// Individual solves commonly land anywhere from 0.3x to 2x of this.
+const EXPECTED_K_FACTOR: f64 = 2.6;
+
+/// Expected operations to solve a range, used as the progress bar length.
+fn expected_ops(range_bits: u32) -> u64 {
+    let ops = EXPECTED_K_FACTOR * 2f64.powf(f64::from(range_bits) / 2.0);
+    ops.min(u64::MAX as f64) as u64
+}
+
+/// Distinguished-point bits for a range and total kangaroo count.
+///
+/// Balances two costs: leftover walk work (kangaroos * 2^dp) must stay a fraction of
+/// sqrt(N), and stored DPs (~2.5 * sqrt(N) / 2^dp) must fit the DP table. Every DP
+/// costs a CPU-side respawn, so only small ranges go below 8 bits.
+pub(crate) fn auto_dp_bits(range_bits: u32, num_kangaroos: u32) -> u32 {
+    let half = range_bits / 2;
+    let kangaroo_bits = num_kangaroos.max(1).ilog2();
+    let for_overhead = half.saturating_sub(kangaroo_bits + 2);
+    let for_table = half.saturating_sub(18);
+    let min_dp = if range_bits < SMALL_RANGE_BITS { 4 } else { 8 };
+    for_overhead.max(for_table).clamp(min_dp, 40)
 }
 
 fn allocate_weighted_kangaroos(total_k: u32, weights: &[u32], min_per_gpu: u32) -> Vec<u32> {
@@ -747,6 +800,43 @@ fn recover_key_from_j(j_bytes: &[u8], mod_step: Scalar, mod_start: Scalar) -> Ve
     k_be[first_nonzero..].to_vec()
 }
 
+/// Map a recovered key to the representative inside `[start, start + 2^range_bits)`.
+///
+/// An x-only target is ambiguous between k and n-k (the two y-parities). Only
+/// one of them lies in a small search range, so return that one. Keys already
+/// in range, or ranges too wide to disambiguate, are returned unchanged.
+fn reduce_key_into_range(key: &[u8], start: &crate::crypto::U256, range_bits: u32) -> Vec<u8> {
+    if key.is_empty() || key.len() > 32 || range_bits >= 256 {
+        return key.to_vec();
+    }
+
+    let mut key_be = [0u8; 32];
+    key_be[32 - key.len()..].copy_from_slice(key);
+    let scalar = Scalar::reduce(K256U256::from_be_slice(&key_be));
+
+    let start_uint = K256U256::from_le_slice(start);
+    let end_uint = start_uint.wrapping_add(&K256U256::ONE.shl_vartime(range_bits as usize));
+    let in_range = |be: &[u8; 32]| {
+        let v = K256U256::from_be_slice(be);
+        v >= start_uint && v < end_uint
+    };
+
+    let trim = |be: [u8; 32]| {
+        let first = be.iter().position(|&x| x != 0).unwrap_or(be.len() - 1);
+        be[first..].to_vec()
+    };
+
+    let pos: [u8; 32] = scalar.to_bytes().into();
+    if in_range(&pos) {
+        return trim(pos);
+    }
+    let neg: [u8; 32] = (-scalar).to_bytes().into();
+    if in_range(&neg) {
+        return trim(neg);
+    }
+    key.to_vec()
+}
+
 fn run_single_gpu_solver(
     args: &Args,
     pubkey: Point,
@@ -777,13 +867,10 @@ fn run_single_gpu_solver(
             requested_num_k, num_k, effective_range
         );
     }
-    let dp_bits = args.dp_bits.map(|v| v.clamp(8, 40)).unwrap_or_else(|| {
-        let density_penalty = (num_k as f64).log2() as u32 / 2;
-        let density_tweak = if effective_range <= 40 { 2 } else { 0 };
-        let auto_dp =
-            (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak));
-        auto_dp.clamp(8, 40)
-    });
+    let dp_bits = args
+        .dp_bits
+        .map(|v| v.clamp(8, 40))
+        .unwrap_or_else(|| auto_dp_bits(effective_range, num_k));
 
     if !args.quiet && !args.json {
         info!("DP bits: {}", dp_bits);
@@ -805,10 +892,7 @@ fn run_single_gpu_solver(
         }
     };
 
-    let expected_ops = 1u128
-        .checked_shl(effective_range / 2)
-        .unwrap_or(u64::MAX as u128)
-        .min(u64::MAX as u128) as u64;
+    let expected_ops = expected_ops(effective_range);
     let pb = if args.quiet || args.json {
         ProgressBar::hidden()
     } else {
@@ -839,6 +923,13 @@ fn run_single_gpu_solver(
                 Some(c) => recover_key_from_j(&j_or_key, c.mod_step, c.mod_start),
                 None => j_or_key,
             };
+
+            if !crypto::verify_key(&private_key, &pubkey) {
+                error!("Verification FAILED - this is a bug!");
+                continue;
+            }
+            let private_key = reduce_key_into_range(&private_key, &start, range_bits);
+
             let duration = start_time.elapsed();
             pb.finish_with_message("FOUND!");
             let key_hex = hex::encode(&private_key);
@@ -848,11 +939,6 @@ fn run_single_gpu_solver(
             } else {
                 key_hex_trimmed
             };
-
-            if !crypto::verify_key(&private_key, &pubkey) {
-                error!("Verification FAILED - this is a bug!");
-                continue;
-            }
 
             if args.json {
                 let time_seconds = duration.as_secs_f64();
@@ -876,7 +962,7 @@ fn run_single_gpu_solver(
             } else if args.quiet {
                 println!("{}", key_hex_display);
             } else {
-                info!("Private key found: 0x{}", key_hex_display);
+                info!("found: 0x{}", key_hex_display);
                 info!("Verification: SUCCESS");
                 info!("Total operations: {}", total_ops);
                 info!("Time elapsed: {:.2}s", duration.as_secs_f64());
@@ -965,7 +1051,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if let Some(ref target) = args.target {
             info!("Target: {}", target);
         }
-        info!("Pubkey: {}", params.pubkey_str);
+        if args.r.is_some() {
+            info!("r (R.x): {}", params.pubkey_str);
+        } else {
+            info!("Pubkey: {}", params.pubkey_str);
+        }
         info!(
             "Search range: {} bits from 0x{}",
             params.range_bits, params.start_str
@@ -1030,10 +1120,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             solve_base_point,
         );
 
-        let expected_ops = 1u128
-            .checked_shl(effective_range / 2)
-            .unwrap_or(u64::MAX as u128)
-            .min(u64::MAX as u128) as u64;
+        let expected_ops = expected_ops(effective_range);
         let pb = if args.quiet || args.json {
             ProgressBar::hidden()
         } else {
@@ -1051,6 +1138,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 Some(c) => recover_key_from_j(&j_or_key, c.mod_step, c.mod_start),
                 None => j_or_key,
             };
+            let private_key = reduce_key_into_range(&private_key, &start, range_bits);
             pb.finish_with_message("FOUND!");
             let key_hex = hex::encode(&private_key);
             let key_hex_trimmed = key_hex.trim_start_matches('0');
@@ -1083,7 +1171,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             } else if args.quiet {
                 println!("{}", key_hex_display);
             } else {
-                info!("Private key found: 0x{}", key_hex_display);
+                info!("found: 0x{}", key_hex_display);
                 info!("Verification: SUCCESS");
                 info!("Total operations: {}", solver.total_ops());
                 info!("Time elapsed: {:.2}s", duration.as_secs_f64());
@@ -1214,13 +1302,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             requested_total_k, total_k, effective_range
         );
     }
-    let dp_bits = args.dp_bits.map(|v| v.clamp(8, 40)).unwrap_or_else(|| {
-        let density_penalty = (total_k as f64).log2() as u32 / 2;
-        let density_tweak = if effective_range <= 40 { 2 } else { 0 };
-        let auto_dp =
-            (effective_range / 2).saturating_sub(density_penalty.saturating_add(density_tweak));
-        auto_dp.clamp(8, 40)
-    });
+    let dp_bits = args
+        .dp_bits
+        .map(|v| v.clamp(8, 40))
+        .unwrap_or_else(|| auto_dp_bits(effective_range, total_k));
 
     let (solve_pubkey, solve_start, solve_range_bits, solve_base_point) = match &constraint {
         Some(c) => (
@@ -1267,7 +1352,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut kangaroo_offset = 0u32;
     for ((gpu_index, ctx, _, _), per_gpu_k) in gpu_contexts
         .into_iter()
-        .zip(per_gpu_k_allocation.into_iter())
+        .zip(per_gpu_k_allocation)
     {
         let solver = solver::KangarooSolver::new_with_base_no_dp_table(
             ctx,
@@ -1285,10 +1370,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         kangaroo_offset = kangaroo_offset.saturating_add(per_gpu_k);
     }
 
-    let expected_ops = 1u128
-        .checked_shl(effective_range / 2)
-        .unwrap_or(u64::MAX as u128)
-        .min(u64::MAX as u128) as u64;
+    let expected_ops = expected_ops(effective_range);
     let pb = if args.quiet || args.json {
         ProgressBar::hidden()
     } else {
@@ -1418,6 +1500,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let final_total_ops = total_ops.load(Ordering::Relaxed);
 
     if let Some(private_key) = found_key {
+        let private_key = reduce_key_into_range(&private_key, &start, range_bits);
         let duration = start_time.elapsed();
         pb.finish_with_message("FOUND!");
         let key_hex = hex::encode(&private_key);
@@ -1450,7 +1533,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         } else if args.quiet {
             println!("{}", key_hex_display);
         } else {
-            info!("Private key found: 0x{}", key_hex_display);
+            info!("found: 0x{}", key_hex_display);
             info!("Verification: SUCCESS");
             info!("Total operations: {}", final_total_ops);
             info!("Time elapsed: {:.2}s", duration.as_secs_f64());
@@ -1573,6 +1656,89 @@ mod cli_tests {
 
         assert_eq!(args.mod_step, "7", "mod_step should be '7'");
         assert_eq!(args.mod_start, "3", "mod_start should be '3'");
+    }
+
+    fn start_le(hex_be: &str) -> crypto::U256 {
+        crypto::parse_hex_u256(hex_be).unwrap()
+    }
+
+    #[test]
+    fn test_reduce_key_into_range_keeps_in_range_key() {
+        let start = start_le("80000");
+        let k = [0x0d, 0x2c, 0x55];
+        assert_eq!(reduce_key_into_range(&k, &start, 20), k.to_vec());
+    }
+
+    #[test]
+    fn test_reduce_key_into_range_recovers_k_from_n_minus_k() {
+        let start = start_le("80000");
+        let k = [0x0d, 0x2c, 0x55];
+        let mut be = [0u8; 32];
+        be[29..].copy_from_slice(&k);
+        let neg: [u8; 32] = (-Scalar::reduce(K256U256::from_be_slice(&be)))
+            .to_bytes()
+            .into();
+        assert_eq!(reduce_key_into_range(&neg, &start, 20), k.to_vec());
+    }
+
+    #[test]
+    fn test_parse_pubkey_x_only_matches_both_parities() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let k = Scalar::from(0xd2c55u64);
+        let point = ProjectivePoint::GENERATOR * k;
+        let encoded = point.to_affine().to_encoded_point(true);
+        let x_hex = hex::encode(&encoded.as_bytes()[1..]);
+
+        let lifted = crypto::parse_pubkey(&x_hex).expect("x-only should parse");
+        assert!(lifted == point || lifted == -point);
+    }
+
+    #[test]
+    fn test_auto_params_keep_leftover_work_below_sqrt_n() {
+        for range in [32u32, 40, 48, 60, 70, 80] {
+            let k = recommended_auto_kangaroos(65_536, range);
+            let dp = auto_dp_bits(range, k);
+            let leftover_bits = k.ilog2() + dp;
+            assert!(
+                leftover_bits <= range / 2 || range < SMALL_RANGE_BITS,
+                "range {range}: kangaroos*2^dp = 2^{leftover_bits} exceeds sqrt(N)"
+            );
+            assert!(
+                range / 2 - dp.min(range / 2) <= 18,
+                "range {range}: dp {dp} would overflow the DP table"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_params_60_bit() {
+        let k = recommended_auto_kangaroos(65_536, 60);
+        assert_eq!(k, 65_536);
+        assert_eq!(auto_dp_bits(60, k), 12);
+    }
+
+    #[test]
+    fn test_cli_r_flag_resolves_as_target() {
+        let r = "3c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
+        let args = Args::try_parse_from(["kangaroo", "--r", r, "--range", "20"]).unwrap();
+        assert_eq!(resolve_params(&args).unwrap().pubkey_str, r);
+    }
+
+    #[test]
+    fn test_cli_r_flag_rejects_compressed_pubkey() {
+        let args = Args::try_parse_from([
+            "kangaroo",
+            "--r",
+            "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c",
+        ])
+        .unwrap();
+        assert!(resolve_params(&args).is_err());
+    }
+
+    #[test]
+    fn test_cli_r_conflicts_with_pubkey() {
+        let r = "3c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
+        assert!(Args::try_parse_from(["kangaroo", "--r", r, "--pubkey", r]).is_err());
     }
 
     #[test]

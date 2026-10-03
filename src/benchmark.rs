@@ -74,11 +74,7 @@ pub fn run_with_context(ctx: gpu_crypto::GpuContext, save_to_markdown: bool) -> 
         let pubkey = crypto::parse_pubkey(case.pubkey)?;
         let start = crypto::parse_hex_u256(case.start)?;
 
-        let density_penalty = (num_k as f64).log2() as u32 / 2;
-        let density_tweak = if case.range_bits <= 40 { 2 } else { 0 };
-        let dp_bits = (case.range_bits / 2)
-            .saturating_sub(density_penalty.saturating_add(density_tweak))
-            .clamp(8, 40);
+        let dp_bits = crate::auto_dp_bits(case.range_bits, num_k);
 
         let mut solver = solver::KangarooSolver::new(
             ctx.clone(),

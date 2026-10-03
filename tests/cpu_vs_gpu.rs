@@ -82,7 +82,7 @@ fn cpu_vs_gpu_benchmark() {
         let dp_bits = (range_bits / 2).saturating_sub(2).clamp(8, 20);
 
         let ctx = pollster::block_on(GpuContext::new(0, GpuBackend::Auto)).expect("GPU context");
-        let mut solver = KangarooSolver::new(ctx, pubkey.clone(), start, range_bits, dp_bits, 4096)
+        let mut solver = KangarooSolver::new(ctx, pubkey, start, range_bits, dp_bits, 4096)
             .expect("solver");
 
         let start_time = Instant::now();

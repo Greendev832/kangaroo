@@ -2,15 +2,16 @@
 //!
 //! Coordinates GPU compute with CPU collision detection.
 
-use crate::cpu::init::{generate_jump_tables, initialize_kangaroos};
+use crate::cpu::init::{generate_jump_tables, initialize_kangaroos, KangarooSpawner};
 use crate::cpu::DPTable;
 use crate::crypto::{Point, U256};
 use crate::gpu::{
     GpuBuffers, GpuConfig, GpuContext, GpuDistinguishedPoint, GpuKangaroo, JumpTableData,
-    KangarooPipeline, WorkgroupVariant,
+    KangarooPipeline, WorkgroupVariant, RESPAWN_FLAG,
 };
 use anyhow::{anyhow, ensure, Result};
 use k256::ProjectivePoint;
+use rayon::prelude::*;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -45,6 +46,9 @@ pub struct KangarooSolver {
     workgroup_size: u32,
     current_slot: usize,
     prev_submission: Option<wgpu::SubmissionIndex>,
+    spawner: KangarooSpawner,
+    kangaroo_offset: u32,
+    respawn_epoch: u64,
 }
 
 impl KangarooSolver {
@@ -55,9 +59,12 @@ impl KangarooSolver {
         [full_limbs, partial_mask, 0, 0]
     }
 
+    /// Longest walk before the GPU gives up on it and asks for a respawn.
+    ///
+    /// Walks average 2^dp_bits steps, so 16x that is only reached by walks stuck in a
+    /// cycle too long for the 64-step checkpoint to catch.
     fn cycle_cap_for(dp_bits: u32) -> u32 {
-        let exp = (dp_bits / 2).min(31);
-        512u32.max(2u32.pow(exp))
+        1u32 << (dp_bits + 4).min(31)
     }
 
     pub fn new(
@@ -147,6 +154,11 @@ impl KangarooSolver {
     ) -> u32 {
         if num_kangaroos == 0 || optimal_steps == 0 {
             return 0;
+        }
+        // A kangaroo stops walking after storing one entry, so a dispatch stores at
+        // most one entry per kangaroo.
+        if num_kangaroos <= max_dps {
+            return optimal_steps;
         }
 
         // 90% headroom keeps expected DP count below buffer capacity to avoid overflow
@@ -296,6 +308,7 @@ impl KangarooSolver {
             kangaroo_offset,
             global_kangaroo_count,
         )?;
+        let spawner = KangarooSpawner::new(&pubkey, &start, range_bits, &base_point)?;
 
         if verbose {
             info!("Probing kernel variants (64/128)...");
@@ -352,10 +365,17 @@ impl KangarooSolver {
             workgroup_size,
             current_slot: 0,
             prev_submission: None,
+            spawner,
+            kangaroo_offset,
+            respawn_epoch: 0,
         };
 
         // Auto-calibrate steps_per_call
         solver.calibrate(dp_bits, verbose)?;
+
+        // Calibration dispatches stop any kangaroo that reaches a DP, and those DPs are
+        // discarded, so start the real search from the untouched initial herd.
+        upload_kangaroos(&solver.ctx, &solver.buffers, &kangaroos)?;
 
         // Update config buffer with calibrated value and correct DP mask
         let cycle_cap = Self::cycle_cap_for(dp_bits);
@@ -430,10 +450,49 @@ impl KangarooSolver {
         } else {
             Vec::new()
         };
+        let dps = self.respawn_finished(dps);
 
         self.prev_submission = Some(new_sub);
         self.current_slot = 1 - write_slot;
         Ok((dps, ops_delta))
+    }
+
+    /// Respawn every kangaroo that ended its walk, and drop respawn-only entries.
+    ///
+    /// Kangaroos stop on the GPU after their walk ends. The respawn writes are queued
+    /// ahead of the next dispatch, so they never race with in-flight work.
+    fn respawn_finished(&mut self, dps: Vec<GpuDistinguishedPoint>) -> Vec<GpuDistinguishedPoint> {
+        if dps.is_empty() {
+            return dps;
+        }
+        self.respawn_epoch += 1;
+        let epoch = self.respawn_epoch;
+        let spawner = &self.spawner;
+        let offset = self.kangaroo_offset;
+        let num_kangaroos = self.num_kangaroos;
+
+        let respawned: Vec<(u32, GpuKangaroo)> = dps
+            .par_iter()
+            .filter(|dp| dp.kangaroo_id < num_kangaroos)
+            .map(|dp| {
+                let ktype = dp.ktype & !RESPAWN_FLAG;
+                let id = dp.kangaroo_id;
+                (id, spawner.spawn(ktype, offset + id, epoch))
+            })
+            .collect();
+
+        let stride = std::mem::size_of::<GpuKangaroo>() as u64;
+        for (id, kangaroo) in &respawned {
+            self.ctx.queue.write_buffer(
+                &self.buffers.kangaroos_buffer,
+                u64::from(*id) * stride,
+                bytemuck::bytes_of(kangaroo),
+            );
+        }
+
+        dps.into_iter()
+            .filter(|dp| dp.ktype & RESPAWN_FLAG == 0)
+            .collect()
     }
 
     /// Read back DPs from a completed slot and reset its counter.
@@ -476,7 +535,11 @@ impl KangarooSolver {
             return Ok(Vec::new());
         };
         let pending_slot = 1 - self.current_slot;
-        self.read_pending(pending_slot, prev_sub)
+        let dps = self.read_pending(pending_slot, prev_sub)?;
+        Ok(dps
+            .into_iter()
+            .filter(|dp| dp.ktype & RESPAWN_FLAG == 0)
+            .collect())
     }
 
     /// Run one batch of GPU operations.
@@ -596,22 +659,18 @@ impl KangarooSolver {
         Ok(())
     }
 
-    /// Calibrate steps_per_call by measuring actual GPU dispatch times
+    /// Calibrate steps_per_call by measuring actual GPU dispatch times.
+    ///
+    /// Picks the candidate with the best useful throughput rather than the largest one
+    /// that fits the time budget. Some GPUs slow down sharply past ~24 steps, and a
+    /// finished kangaroo idles until respawned (rest of its dispatch plus the next one,
+    /// ~1.5 dispatches), which penalizes long dispatches when walks are short.
     fn calibrate(&mut self, dp_bits: u32, verbose: bool) -> Result<()> {
-        // Benchmark-sized solves hit a sharp cliff between 24 and 32 steps on the
-        // tested GPUs, so probe a few low-end values before jumping back to the
-        // usual power-of-two sweep. Keep the list short - calibration dispatches
-        // still burn startup work even though their DP output gets dropped.
-        let candidates = [16u32, 17, 18, 24, 64, 128, 256, 512];
-        let mut best_steps = candidates[0];
+        let candidates = [8u32, 16, 24, 32, 64, 128, 256, 512, 1024];
+        let walk_len = f64::from(1u32 << dp_bits.min(31));
+        let mut best: Option<(u32, f64)> = None;
+        let mut last_probe: Option<(u32, f64)> = None;
         let dp_meta = Self::dp_meta(dp_bits);
-
-        if self.workgroup_size == 64 && self.num_kangaroos <= 65_536 && self.steps_per_call == 16 {
-            if verbose {
-                info!("Skipping calibration for small-herd Wg64 path; using steps_per_call=16");
-            }
-            return Ok(());
-        }
 
         if verbose {
             info!("Calibrating GPU performance...");
@@ -636,7 +695,7 @@ impl KangarooSolver {
                 num_kangaroos: self.num_kangaroos,
                 steps_per_call: steps,
                 jump_table_size: JUMP_TABLE_SIZE,
-                cycle_cap: 512, // Default floor for calibration
+                cycle_cap: Self::cycle_cap_for(dp_bits),
             };
             self.ctx.queue.write_buffer(
                 &self.buffers.config_buffer,
@@ -658,27 +717,44 @@ impl KangarooSolver {
             if self.dispatch_once().is_err() {
                 break; // GPU too slow for this candidate, keep last good value
             }
-            let elapsed_ms = start.elapsed().as_millis();
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_millis();
+            let useful_fraction = walk_len / (walk_len + 1.5 * f64::from(steps));
+            let useful_rate = f64::from(self.num_kangaroos) * f64::from(steps) * useful_fraction
+                / elapsed.as_secs_f64().max(1e-6);
 
             if verbose {
-                info!("  steps_per_call={}: {}ms", steps, elapsed_ms);
+                info!(
+                    "  steps_per_call={}: {}ms, {:.2}M useful ops/s",
+                    steps,
+                    elapsed_ms,
+                    useful_rate / 1e6
+                );
             }
 
-            if elapsed_ms <= TARGET_DISPATCH_MS {
-                best_steps = steps;
-
-                // Candidates double each time. If we're already above half the budget,
-                // the next probe is overwhelmingly likely to miss and just burn startup time.
-                if elapsed_ms.saturating_mul(2) > TARGET_DISPATCH_MS {
-                    break;
-                }
-            } else {
-                // Too slow, stop searching
+            if elapsed_ms > TARGET_DISPATCH_MS {
                 break;
             }
+            if best.is_none_or(|(_, rate)| useful_rate > rate) {
+                best = Some((steps, useful_rate));
+            }
+            // Skip a probe that would clearly miss the budget. Dispatches have a large
+            // fixed cost on big herds, so extrapolate from the last two probes rather
+            // than assuming time scales with steps.
+            let secs = elapsed.as_secs_f64();
+            if let (Some((prev_steps, prev_secs)), Some(&next)) =
+                (last_probe, candidates.iter().find(|&&c| c > steps))
+            {
+                let per_step = (secs - prev_secs).max(0.0) / f64::from(steps - prev_steps);
+                let predicted_ms = (secs + per_step * f64::from(next - steps)) * 1000.0;
+                if predicted_ms > TARGET_DISPATCH_MS as f64 {
+                    break;
+                }
+            }
+            last_probe = Some((steps, secs));
         }
 
-        // Apply the best value
+        let best_steps = best.map_or(candidates[0], |(steps, _)| steps);
         self.steps_per_call = best_steps;
 
         if verbose {
@@ -756,8 +832,15 @@ mod tests {
     fn caps_steps_when_dp_buffer_would_overflow() {
         // With dense DPs (8 bits) and many kangaroos, a large steps_per_call would overflow the DP buffer.
         let steps =
-            KangarooSolver::select_steps_per_call(4_096, 16_384, 8, MAX_DISTINGUISHED_POINTS);
-        assert_eq!(steps, 921);
+            KangarooSolver::select_steps_per_call(4_096, 262_144, 8, MAX_DISTINGUISHED_POINTS);
+        assert_eq!(steps, 57);
+    }
+
+    #[test]
+    fn herd_within_buffer_never_overflows() {
+        let steps =
+            KangarooSolver::select_steps_per_call(4_096, 16_384, 4, MAX_DISTINGUISHED_POINTS);
+        assert_eq!(steps, 4_096);
     }
 
     #[test]

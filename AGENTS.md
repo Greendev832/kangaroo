@@ -74,7 +74,7 @@ kangaroo/
 
 - **Shaders**: WGSL files in `src/gpu_crypto/shaders/` (library) and `src/shaders/` (main compute)
 - **Field arithmetic**: 256-bit represented as `array<u32, 8>` in WGSL, little-endian limbs
-- **DP bits**: Auto-calculated from range_bits, clamped 8-40
+- **DP bits**: Auto-calculated from range_bits and herd size (`auto_dp_bits`), clamped 8-40 (4-40 below 44-bit ranges)
 - **Feature flags**: `boha` enables puzzle data provider
 - **Release profile**: LTO enabled, codegen-units=1, panic=abort, strip=true
 

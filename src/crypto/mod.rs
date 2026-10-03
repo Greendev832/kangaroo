@@ -15,8 +15,21 @@ pub type U256 = [u8; 32];
 pub type Point = ProjectivePoint;
 
 /// Parse compressed public key from hex
+///
+/// Accepts a 33-byte compressed key (`02`/`03` prefix) or a bare 32-byte
+/// x-coordinate. For an x-only input the even-y point is lifted; the solver's
+/// negation map makes the parity choice irrelevant to the search, and callers
+/// can normalize the recovered key into their range to resolve k vs n-k.
 pub fn parse_pubkey(hex_str: &str) -> Result<Point> {
-    let bytes = hex::decode(hex_str.trim_start_matches("0x")).context("Invalid hex in pubkey")?;
+    let mut bytes = hex::decode(hex_str.trim_start_matches("0x")).context("Invalid hex in pubkey")?;
+
+    // Lift a bare x-coordinate to a point by assuming even y (0x02 prefix).
+    if bytes.len() == 32 {
+        let mut compressed = Vec::with_capacity(33);
+        compressed.push(0x02);
+        compressed.extend_from_slice(&bytes);
+        bytes = compressed;
+    }
 
     let encoded = EncodedPoint::from_bytes(&bytes)
         .map_err(|e| anyhow::anyhow!("Invalid encoded point: {e}"))?;

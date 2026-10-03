@@ -70,6 +70,105 @@ fn make_step_scalar_bytes(index: u32, exp_bits: u32, salt: u32) -> [u8; 32] {
     scalar_bytes
 }
 
+/// Places kangaroos at random positions inside their set.
+///
+/// With the negation map, walks diffuse around their start instead of travelling,
+/// so coverage comes from where kangaroos are (re)spawned:
+/// - tame (ktype=0): uniform over the whole search interval `[start, start + 2^range_bits)`
+/// - wild_1 (ktype=1): uniform over `P + [-2^(range_bits-1), 2^(range_bits-1))`
+/// - wild_2 (ktype=2): same offsets around `-P`, for cross-wild collisions
+///
+/// Tame and wild sets therefore overlap by at least half the interval for any key.
+pub struct KangarooSpawner {
+    pubkey: Point,
+    neg_pubkey: Point,
+    start: U256,
+    range_mask: K256U256,
+    range_middle: K256U256,
+    base_point: ProjectivePoint,
+    base_is_generator: bool,
+}
+
+impl KangarooSpawner {
+    pub fn new(
+        pubkey: &Point,
+        start: &U256,
+        range_bits: u32,
+        base_point: &ProjectivePoint,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            range_bits > 0 && range_bits <= 255,
+            "range_bits must be 1..=255"
+        );
+        let range_size = K256U256::ONE.shl_vartime(range_bits as usize);
+        Ok(Self {
+            pubkey: *pubkey,
+            neg_pubkey: pubkey.neg(),
+            start: *start,
+            range_mask: range_size.wrapping_sub(&K256U256::ONE),
+            range_middle: K256U256::ONE.shl_vartime((range_bits - 1) as usize),
+            base_point: *base_point,
+            base_is_generator: *base_point == ProjectivePoint::GENERATOR,
+        })
+    }
+
+    /// Spawn a kangaroo of `ktype` at a position derived from `(global_id, epoch)`.
+    ///
+    /// The same inputs always give the same kangaroo; bump `epoch` for a fresh position.
+    pub fn spawn(&self, ktype: u32, global_id: u32, epoch: u64) -> GpuKangaroo {
+        let offset = random_u256(global_id, epoch) & self.range_mask;
+
+        let (point, dist) = match ktype {
+            0 => init_tame_kangaroo_at_offset(
+                &self.start,
+                &offset,
+                &self.base_point,
+                self.base_is_generator,
+            ),
+            1 => init_wild_kangaroo_at_offset(
+                &self.pubkey,
+                &offset,
+                &self.range_middle,
+                &self.base_point,
+                self.base_is_generator,
+            ),
+            _ => init_wild_kangaroo_at_offset(
+                &self.neg_pubkey,
+                &offset,
+                &self.range_middle,
+                &self.base_point,
+                self.base_is_generator,
+            ),
+        };
+
+        let gpu_point = affine_to_gpu(&point);
+
+        GpuKangaroo {
+            x: gpu_point.x,
+            y: gpu_point.y,
+            dist,
+            ktype,
+            is_active: 1,
+            cycle_counter: 0,
+            checkpoint_x: gpu_point.x[0],
+            last_jump: 0xFFFFFFFF,
+            _padding: [0; 3],
+        }
+    }
+}
+
+/// Kangaroo type for local index `i`: first third tame, second wild_1, rest wild_2.
+pub fn ktype_for_index(i: u32, num_kangaroos: u32) -> u32 {
+    let one_third = num_kangaroos / 3;
+    if i < one_third {
+        0
+    } else if i < 2 * one_third {
+        1
+    } else {
+        2
+    }
+}
+
 /// Initialize kangaroo positions.
 ///
 /// Split into three sets: tame (ktype=0), wild_1 (ktype=1), wild_2 (ktype=2).
@@ -87,22 +186,13 @@ pub fn initialize_kangaroos(
     num_kangaroos: u32,
     base_point: &ProjectivePoint,
     kangaroo_offset: u32,
-    global_kangaroo_count: u32,
+    _global_kangaroo_count: u32,
 ) -> Result<Vec<GpuKangaroo>> {
     anyhow::ensure!(
         num_kangaroos >= 3,
         "Multi-set requires at least 3 kangaroos"
     );
-    anyhow::ensure!(
-        range_bits > 0 && range_bits <= 255,
-        "range_bits must be 1..=255"
-    );
-
-    let one_third = num_kangaroos / 3;
-
-    // Full 256-bit range arithmetic
-    let range_size = K256U256::ONE.shl_vartime(range_bits as usize);
-    let range_middle = K256U256::ONE.shl_vartime((range_bits - 1) as usize);
+    let spawner = KangarooSpawner::new(pubkey, start, range_bits, base_point)?;
 
     tracing::debug!(
         "Kangaroo init: range_bits={}, num_kangaroos={}",
@@ -110,115 +200,35 @@ pub fn initialize_kangaroos(
         num_kangaroos
     );
 
-    // Grid delta for even distribution (full 256-bit division)
-    let total_k = K256U256::from(global_kangaroo_count.max(1) as u64);
-    let grid_delta = div_u256(&range_size, &total_k);
-    let grid_delta = if grid_delta == K256U256::ZERO {
-        K256U256::ONE
-    } else {
-        grid_delta
-    };
-
-    // range_size is always a power of two here, so modulo can use a cheap bitmask.
-    let range_mask = range_size.wrapping_sub(&K256U256::ONE);
-    let jitter_span = grid_delta.shr_vartime(1);
-    let jitter_span = if jitter_span == K256U256::ZERO {
-        K256U256::ONE
-    } else {
-        jitter_span
-    };
-    let jitter_mask = jitter_span.wrapping_sub(&K256U256::ONE);
-    let jitter_span_is_power_of_two = (jitter_span & jitter_mask) == K256U256::ZERO;
-
-    let neg_pubkey = pubkey.neg();
-    let base_is_generator = *base_point == ProjectivePoint::GENERATOR;
-
-    // Parallel initialization with rayon
     let kangaroos: Vec<GpuKangaroo> = (0..num_kangaroos)
         .into_par_iter()
         .map(|i| {
-            let ktype = if i < one_third {
-                0 // tame
-            } else if i < 2 * one_third {
-                1 // wild_1
-            } else {
-                2 // wild_2
-            };
-
-            // Grid-based offset + small random jitter (all 256-bit)
-            let global_i = kangaroo_offset + i;
-            let i_uint = K256U256::from(global_i as u64);
-            let grid_pos = i_uint.wrapping_mul(&grid_delta);
-
-            let prng_seed = hash_seed(global_i, 0xCAFEBABE);
-            let seed_uint = u128_to_u256(prng_seed);
-            let jitter = if jitter_span_is_power_of_two {
-                seed_uint & jitter_mask
-            } else {
-                rem_u256(&seed_uint, &jitter_span)
-            };
-
-            let sum = grid_pos.wrapping_add(&jitter);
-            let offset = sum & range_mask;
-
-            let (point, dist) = match ktype {
-                0 => init_tame_kangaroo_at_offset(start, &offset, base_point, base_is_generator),
-                1 => init_wild_kangaroo_at_offset(
-                    pubkey,
-                    &offset,
-                    &range_middle,
-                    base_point,
-                    base_is_generator,
-                ),
-                _ => init_wild_kangaroo_at_offset(
-                    &neg_pubkey,
-                    &offset,
-                    &range_middle,
-                    base_point,
-                    base_is_generator,
-                ),
-            };
-
-            let gpu_point = affine_to_gpu(&point);
-
-            GpuKangaroo {
-                x: gpu_point.x,
-                y: gpu_point.y,
-                dist,
-                ktype,
-                is_active: 1,
-                cycle_counter: 0,
-                repeat_count: 0,
-                last_jump: 0xFFFFFFFF,
-                _padding: [0; 3],
-            }
+            spawner.spawn(
+                ktype_for_index(i, num_kangaroos),
+                kangaroo_offset + i,
+                0,
+            )
         })
         .collect();
 
     Ok(kangaroos)
 }
 
-/// FNV-1a hash for deterministic PRNG seeding.
-fn hash_seed(index: u32, salt: u64) -> u128 {
-    let mut h = 0xcbf29ce484222325u64; // FNV offset basis
-
-    h ^= index as u64;
-    h = h.wrapping_mul(0x100000001b3); // FNV prime
-    h ^= salt;
-    h = h.wrapping_mul(0x100000001b3);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-
-    let h2 = h.wrapping_mul(0xc4ceb9fe1a85ec53) ^ (index as u64).wrapping_mul(0x9e3779b97f4a7c15);
-    ((h as u128) << 64) | (h2 as u128)
-}
-
-/// Convert u128 to K256U256.
-fn u128_to_u256(val: u128) -> K256U256 {
-    let mut le = [0u8; 32];
-    le[0..16].copy_from_slice(&val.to_le_bytes());
-    K256U256::from_le_slice(&le)
+/// Deterministic 256 pseudo-random bits from `(global_id, epoch)` (splitmix64 stream).
+fn random_u256(global_id: u32, epoch: u64) -> K256U256 {
+    let mut state = (u64::from(global_id) << 32)
+        ^ epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ 0xCAFE_BABE_D15E_A5E5;
+    let mut bytes = [0u8; 32];
+    for chunk in bytes.as_chunks_mut::<8>().0 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        *chunk = z.to_le_bytes();
+    }
+    K256U256::from_le_slice(&bytes)
 }
 
 /// Extract big-endian [u8; 32] from K256U256 via limb decomposition.
@@ -232,31 +242,6 @@ fn u256_to_be_bytes(val: &K256U256) -> [u8; 32] {
         bytes[i * sz..(i + 1) * sz].copy_from_slice(&be);
     }
     bytes
-}
-
-/// Divide two K256U256 values. Returns zero if divisor is zero.
-fn div_u256(a: &K256U256, b: &K256U256) -> K256U256 {
-    if *b == K256U256::ZERO {
-        return K256U256::ZERO;
-    }
-    let nz = nonzero_u256(*b);
-    let (q, _) = a.div_rem(&nz);
-    q
-}
-
-/// Remainder of K256U256 division. Returns `a` if divisor is zero.
-fn rem_u256(a: &K256U256, b: &K256U256) -> K256U256 {
-    if *b == K256U256::ZERO {
-        return *a;
-    }
-    let nz = nonzero_u256(*b);
-    let (_, r) = a.div_rem(&nz);
-    r
-}
-
-/// Create NonZero<K256U256>. Panics on zero.
-fn nonzero_u256(val: K256U256) -> crypto_bigint::NonZero<K256U256> {
-    Option::from(crypto_bigint::NonZero::new(val)).expect("value must be non-zero")
 }
 
 fn mul_base(
@@ -389,6 +374,49 @@ mod tests {
         assert_eq!(tame + wild1 + wild2, num_kangaroos as usize);
     }
 
+    /// Tames must reach the top of the interval: keys there were unsolvable when tames
+    /// only covered the first third.
+    #[test]
+    fn test_tames_cover_whole_interval() {
+        let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
+        let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
+        let range_bits = 20u32;
+        let kangaroos = initialize_kangaroos(
+            &pubkey,
+            &[0u8; 32],
+            range_bits,
+            3000,
+            &ProjectivePoint::GENERATOR,
+            0,
+            3000,
+        )
+        .unwrap();
+
+        let tame_offsets: Vec<u32> = kangaroos
+            .iter()
+            .filter(|k| k.ktype == 0)
+            .map(|k| k.dist[0])
+            .collect();
+        let range = 1u32 << range_bits;
+        assert!(tame_offsets.iter().all(|&o| o < range));
+        assert!(tame_offsets.iter().any(|&o| o > range / 10 * 9));
+        assert!(tame_offsets.iter().any(|&o| o < range / 10));
+    }
+
+    #[test]
+    fn test_spawn_epochs_give_fresh_positions() {
+        let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
+        let pubkey = crate::crypto::parse_pubkey(pubkey_hex).expect("Failed to parse pubkey");
+        let spawner =
+            KangarooSpawner::new(&pubkey, &[0u8; 32], 40, &ProjectivePoint::GENERATOR).unwrap();
+
+        let a = spawner.spawn(1, 7, 1);
+        assert_eq!(a.x, spawner.spawn(1, 7, 1).x, "spawn must be deterministic");
+        assert_ne!(a.x, spawner.spawn(1, 7, 2).x, "new epoch must move the kangaroo");
+        assert_eq!(a.checkpoint_x, a.x[0]);
+        assert_eq!(a.is_active, 1);
+    }
+
     #[test]
     fn test_minimum_kangaroo_count() {
         let pubkey_hex = "033c4a45cbd643ff97d77f41ea37e843648d50fd894b864b0d52febc62f6454f7c";
@@ -433,13 +461,15 @@ mod tests {
         )
         .unwrap();
 
-        let gpu0_states: HashSet<([u32; 8], [u32; 8], [u32; 8], u32)> = gpu0
+        type KangarooState = ([u32; 8], [u32; 8], [u32; 8], u32);
+
+        let gpu0_states: HashSet<KangarooState> = gpu0
             .iter()
-            .map(|k| (k.x, k.y, k.dist, k.ktype as u32))
+            .map(|k| (k.x, k.y, k.dist, k.ktype))
             .collect();
 
         for k in &gpu1 {
-            let state = (k.x, k.y, k.dist, k.ktype as u32);
+            let state = (k.x, k.y, k.dist, k.ktype);
             assert!(
                 !gpu0_states.contains(&state),
                 "GPU workers must not share initial kangaroo states"

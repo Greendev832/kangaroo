@@ -27,11 +27,16 @@ pub struct GpuKangaroo {
     pub dist: [u32; 8],
     pub ktype: u32,
     pub is_active: u32,
+    /// Steps since the kangaroo was (re)spawned.
     pub cycle_counter: u32,
-    pub repeat_count: u32,
+    /// Low limb of x saved every 64 steps; seeing it again means a fruitless cycle.
+    pub checkpoint_x: u32,
     pub last_jump: u32,
     pub _padding: [u32; 3],
 }
+
+/// Set in a DP's `ktype` when the GPU abandoned a stuck walk: respawn it, don't store it.
+pub const RESPAWN_FLAG: u32 = 0x100;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

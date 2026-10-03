@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     println!("Creating solver...");
     let mut solver = KangarooSolver::new(
         ctx,
-        pubkey.clone(),
+        pubkey,
         start,
         range_bits,
         dp_bits,

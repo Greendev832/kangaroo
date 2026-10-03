@@ -280,19 +280,31 @@ impl CpuKangarooSolver {
 
         let limit = 1u64.checked_shl(self.range_bits)?;
 
+        let neg_pubkey = -self.pubkey;
+        let trim = |s: Scalar| {
+            let key_bytes = s.to_bytes();
+            let first_nonzero = key_bytes.iter().position(|&x| x != 0).unwrap_or(31);
+            key_bytes[first_nonzero..].to_vec()
+        };
+
         let mut candidate = self.start;
+        let mut point = self.base_point * candidate;
         for _ in 0..limit {
             if started.elapsed() > timeout {
                 return None;
             }
 
-            let key_bytes = candidate.to_bytes();
-            let first_nonzero = key_bytes.iter().position(|&x| x != 0).unwrap_or(31);
-            let trimmed = &key_bytes[first_nonzero..];
-            if crate::crypto::verify_key_with_base(trimmed, &self.pubkey, &self.base_point) {
-                return Some(trimmed.to_vec());
+            // An x-only target may be lifted to the wrong y-parity, in which case
+            // the in-range key maps to -P. Return n-k so the result still
+            // satisfies key*base == pubkey, matching the kangaroo paths.
+            if point == self.pubkey {
+                return Some(trim(candidate));
+            }
+            if point == neg_pubkey {
+                return Some(trim(-candidate));
             }
             candidate += Scalar::ONE;
+            point += self.base_point;
         }
 
         None
