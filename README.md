@@ -76,7 +76,7 @@ kangaroo --r <R_X> --start <START> --range <BITS>
 | `--include-integrated` | false | Include integrated GPUs in `--gpu all` |
 | `--list-gpus` | false | List available GPU devices |
 | `--backend` | auto | GPU backend: `auto`, `vulkan`, `dx12`, `metal`, `gl` |
-| `-o, --output` | - | Write the found private key (hex) to this file |
+| `-o, --output` | - | Write the found private key (hex) to this file. With `--electrum-recover`: append the seed and its keys (default `electrum_recovered.txt`) |
 | `-q, --quiet` | false | Minimal output, just print found key |
 | `--max-ops` | 0 | Give up after this many operations (0 = unlimited) |
 | `--cpu` | false | Use CPU solver instead of GPU |
@@ -86,6 +86,13 @@ kangaroo --r <R_X> --start <START> --range <BITS>
 | `--mod-step` | 1 | Modular step M (hex): search only k ≡ R (mod M) |
 | `--mod-start` | 0 | Modular residue R (hex): 0 ≤ R < M |
 | `--list-providers` | false | List available puzzles from providers |
+| `--electrum-seed` | - | Old (2012-2013) Electrum seed (12/24 words or 32/64 hex chars, `-` for stdin): print its addresses and keys |
+| `--electrum-count` | 5 | Receiving and change addresses to derive with `--electrum-seed`, or to check per candidate with `--electrum-recover` |
+| `--electrum-recover` | - | Recover an old Electrum seed from a 12-word pattern (`?` = unknown word, `a\|b` = uncertain word). GPU by default, `--cpu` to use CPU cores |
+| `--electrum-address` | - | Address known to belong to the wallet being recovered (repeatable) |
+| `--electrum-address-file` | - | Text file of such addresses, one per line (repeatable) |
+| `--electrum-pubkey` | - | Public key known to belong to the wallet (repeatable): an address's key (33/65 bytes hex) or the master public key (64 bytes / 128 hex chars) |
+| `--electrum-pubkey-file` | - | Text file of such public keys, one per line (repeatable) |
 
 One of `--target`, `--pubkey` or `--r` is required. Note that `-r` (short) is `--range`, while `--r` (long) is the signature value.
 
@@ -130,6 +137,96 @@ kangaroo \
 ```bash
 kangaroo --r <R_X> --start 0 --range 56 --max-ops 5000000000 --json >> results.jsonl
 ```
+
+**Addresses from an old (2012-2013, pre-2.0) Electrum seed:**
+
+```bash
+# Seed on the command line (12 words or 32 hex chars)
+kangaroo --electrum-seed "powerful random nobody notice nothing important anyway look away hidden message over" --electrum-count 10
+
+# Read the seed from stdin so it stays out of shell history; --json adds pubkeys and raw private keys
+kangaroo --electrum-seed - --json < seed.txt
+```
+
+This prints the receiving and change addresses with uncompressed WIF private keys, as old Electrum derived them: the hex seed is stretched with 100,000 rounds of SHA-256 into a master key, and key `n` of a chain is `master + sha256d("n:change:" || master_pubkey)`. Addresses are P2PKH of uncompressed public keys. Newer Electrum seeds (2.0+, BIP32-based) are not supported.
+
+**Recovering an old Electrum seed with missing or uncertain words (GPU):**
+
+```bash
+# One word unknown ("?"), one word uncertain ("a|b|c"), and an address the wallet used
+kangaroo --electrum-recover "powerful random nobody notice ? important anyway look away hidden message over|other|order" \
+    --electrum-address 1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo \
+    -o recovered_seed.txt
+```
+
+When a seed is found it is saved, before anything is printed, to `electrum_recovered.txt` in the current directory (or the file given with `-o`). The file gets the seed words, hex seed, master public key, the matched address, and the first `--electrum-count` receiving and change addresses (at least up to the matched one) with their private keys in hex and WIF. Results are appended, never overwritten, and the file is created readable by your user only (mode 600) because it holds private keys:
+
+```text
+=== Recovered old Electrum seed (unix time 1791393576) ===
+Seed words:        powerful random nobody notice nothing important anyway look away hidden message over
+Seed (hex):        acb740e454c3134901d7c8f16497cc1c
+Master public key: e9d4b7866dd1e91c862aebf62a49548c7dbf7bcc6e4b7b8c9da820c7737968df9c09d5a3e271dc814a29981f81b3faaf2737b551ef5dcc6189cf0f8252c442b3
+Matched:           19dmGS6TfnJuhQYCMYMMn9YxzuF8LVVgzg (receiving #2)
+
+chain      index  address                             private key (hex)                                                 WIF (uncompressed)
+receiving      0  1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo  8fdf5bc0fdd0bcfb03dd2d050d903a783e5b36de98f3963a025d2e8f0629faa5  5JuecQZ1nH4VCQRQJTQjB4yu93BU6NmnAkDoGRdHX2PyH2E8QVX
+...
+```
+
+Instead of an address you can give a public key with `--electrum-pubkey`:
+
+```bash
+# The master public key (MPK) old Electrum showed and stored in the wallet file: fastest check
+kangaroo --electrum-recover "powerful random nobody notice ? important anyway look away hidden message over" \
+    --electrum-pubkey e9d4b7866dd1e91c862aebf62a49548c7dbf7bcc6e4b7b8c9da820c7737968df9c09d5a3e271dc814a29981f81b3faaf2737b551ef5dcc6189cf0f8252c442b3
+
+# The public key of any wallet address (e.g. from a spending transaction), compressed or uncompressed
+kangaroo --electrum-recover "..." --electrum-pubkey 045f7ba332df2a7b4f5d13f246e307c9174cfa9b8b05f3b83410a3c23ef8958d610be285963d67c7bc1feb082f168fa9877c25999963ff8b56b242a852b23e25ed
+```
+
+Many addresses can be loaded from a text file with `--electrum-address-file`, one per line, in the same format as the public key file below:
+
+```text
+# addresses from my old wallet
+1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo,receiving-0
+19dmGS6TfnJuhQYCMYMMn9YxzuF8LVVgzg
+```
+
+```bash
+kangaroo --electrum-recover "..." --electrum-address-file addresses.txt
+```
+
+Many keys can be loaded from a text file with `--electrum-pubkey-file`. Each line holds one key (compressed, uncompressed or master public key); blank lines and `#` comments are skipped, and anything after the key (`,label` or ` label`) is ignored:
+
+```text
+# public keys collected from old transactions
+045f7ba332df2a7b4f5d13f246e307c9174cfa9b8b05f3b83410a3c23ef8958d610be285963d67c7bc1feb082f168fa9877c25999963ff8b56b242a852b23e25ed,receiving-0
+02aecb9d427e10f0c370c32210fe75b6e72ccc4f415076cf1a6318fbed55373888
+```
+
+```bash
+kangaroo --electrum-recover "..." --electrum-pubkey-file pubkeys.txt
+```
+
+All keys go into one lookup set, so checking a candidate against thousands of keys costs the same as checking one. An invalid line stops the run with its file name and line number.
+
+Every candidate seed is stretched with 100,000 SHA-256 rounds on the GPU, then checked on the CPU, overlapped with the next GPU batch: its master public key is compared first, then (if an address or address public key was given) its first `--electrum-count` receiving and change addresses. A master public key needs one EC multiplication per candidate instead of eleven. Old seeds have no checksum, so a known address or key is the only way to tell the right seed apart.
+
+The GPU path is tuned for Apple Silicon (Metal) but runs on any wgpu backend:
+
+- Each GPU dispatch is calibrated to ~40 ms, so the desktop stays responsive while the GPU (which also drives the display) is busy
+- Batches start at 65,536 seeds (enough to saturate an M4 Pro) and grow to ~2 s of work each
+- The SHA-256 rounds are fully unrolled, and the constant padding block's message schedule is precomputed
+
+Measured on an Apple M4 Pro: about 8,000 seeds/s on the GPU versus about 350 seeds/s on all CPU cores (`--cpu`).
+
+| Unknown words | Candidates | Time on M4 Pro GPU |
+|---------------|------------|--------------------|
+| 1 | 1,626 | ~1 s |
+| 2 | 2.6 million | ~6 minutes |
+| 3 | 4.3 billion | ~6 days |
+
+Uncertain words multiply the count by their number of alternatives, so narrowing an unknown word to a few guesses helps a lot.
 
 **With modular constraint (k ≡ 37 mod 60):**
 

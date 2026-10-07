@@ -10,6 +10,7 @@ mod cli;
 mod convert;
 mod cpu;
 mod crypto;
+pub mod electrum;
 mod gpu;
 mod gpu_crypto;
 mod math;
@@ -96,7 +97,8 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "auto")]
     backend: gpu_crypto::GpuBackend,
 
-    /// Output file for result (hex private key)
+    /// Output file for result: the hex private key, or with --electrum-recover the seed
+    /// and its keys (appended; default electrum_recovered.txt)
     #[arg(short, long)]
     output: Option<String>,
 
@@ -131,6 +133,44 @@ pub struct Args {
     /// Modular residue (hex): class residue for constraint (0 ≤ R < M) [e.g. 25 = 37]
     #[arg(long, default_value = "0")]
     mod_start: String,
+
+    /// Old (2012-2013, pre-2.0) Electrum seed: 12/24 words or 32/64 hex chars, or "-"
+    /// to read it from stdin. Prints the wallet's addresses and private keys.
+    #[arg(long, conflicts_with_all = ["pubkey", "r", "target"])]
+    electrum_seed: Option<String>,
+
+    /// Number of receiving and change addresses to derive with --electrum-seed, or to
+    /// check per candidate with --electrum-recover
+    #[arg(long, default_value = "5")]
+    electrum_count: u32,
+
+    /// Recover an old Electrum seed: 12 words, "?" for an unknown word, "a|b" for an
+    /// uncertain one. Needs --electrum-address or --electrum-pubkey. Runs on the GPU
+    /// unless --cpu is given
+    #[arg(
+        long,
+        conflicts_with_all = ["pubkey", "r", "target", "electrum_seed"]
+    )]
+    electrum_recover: Option<String>,
+
+    /// Address known to belong to the wallet being recovered (repeatable)
+    #[arg(long)]
+    electrum_address: Vec<String>,
+
+    /// Text file of addresses for --electrum-recover, one per line ("#" comments and
+    /// blank lines skipped; extra columns after the address ignored). Repeatable
+    #[arg(long)]
+    electrum_address_file: Vec<PathBuf>,
+
+    /// Public key known to belong to the wallet being recovered (repeatable): an
+    /// address's key (33/65 bytes hex) or the master public key (64 bytes hex, fastest)
+    #[arg(long)]
+    electrum_pubkey: Vec<String>,
+
+    /// Text file of public keys for --electrum-recover, one per line ("#" comments
+    /// and blank lines skipped; extra columns after the key ignored). Repeatable
+    #[arg(long)]
+    electrum_pubkey_file: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -751,6 +791,232 @@ fn auto_calibrate_gpu_weights(
     measured_weights
 }
 
+fn print_electrum_addresses(
+    seed_arg: &str,
+    count: u32,
+    json: bool,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let seed = if seed_arg == "-" {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        input
+    } else {
+        seed_arg.to_string()
+    };
+
+    let wallet = electrum::OldElectrumWallet::from_seed(&seed)?;
+    let receiving = wallet.addresses(false, count)?;
+    let change = wallet.addresses(true, count)?;
+
+    if json {
+        let out = serde_json::json!({
+            "seed_hex": wallet.hex_seed(),
+            "master_public_key": wallet.master_public_key_hex(),
+            "receiving": receiving,
+            "change": change,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if quiet {
+        for derived in receiving.iter().chain(&change) {
+            println!("{}", derived.address);
+        }
+        return Ok(());
+    }
+
+    println!("Seed (hex):        {}", wallet.hex_seed());
+    println!("Master public key: {}", wallet.master_public_key_hex());
+    for (label, list) in [("receiving", &receiving), ("change", &change)] {
+        println!();
+        println!(
+            "{:<10} {:>5}  {:<34}  WIF (uncompressed)",
+            "chain", "index", "address"
+        );
+        for derived in list {
+            println!(
+                "{:<10} {:>5}  {:<34}  {}",
+                label, derived.index, derived.address, derived.wif
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_electrum_recover(args: &Args, pattern: &str) -> anyhow::Result<()> {
+    use electrum::recover::{recover, MatchedKey, SeedPattern, Stretcher, Targets};
+
+    let pattern = SeedPattern::parse(pattern)?;
+    let mut targets = Targets::new();
+    for address in &args.electrum_address {
+        targets.add_address(address)?;
+    }
+    for pubkey in &args.electrum_pubkey {
+        targets.add_pubkey(pubkey)?;
+    }
+    let quiet = args.quiet || args.json;
+    for path in &args.electrum_address_file {
+        let added = targets.add_address_file(path)?;
+        if !quiet {
+            info!("Loaded {} addresses from {}", added, path.display());
+        }
+    }
+    for path in &args.electrum_pubkey_file {
+        let added = targets.add_pubkey_file(path)?;
+        if !quiet {
+            info!("Loaded {} public keys from {}", added, path.display());
+        }
+    }
+    targets.ensure_not_empty()?;
+    let total = pattern.candidate_count();
+
+    let mut stretcher = if args.cpu {
+        Stretcher::Cpu
+    } else {
+        let index: u32 = args.gpu.trim().parse().map_err(|_| {
+            anyhow!("--electrum-recover uses one GPU; pass a single index to --gpu")
+        })?;
+        let ctx = pollster::block_on(GpuContext::new_from_global_index(index, args.backend))?;
+        Stretcher::Gpu(Box::new(electrum::gpu::GpuStretcher::new(ctx)?))
+    };
+
+    if !quiet {
+        info!("Candidates: {} on {}", total, stretcher.name());
+        info!("Targets: {} distinct addresses/keys", targets.len());
+        if targets.needs_addresses() {
+            info!(
+                "Checking the master public key and first {} receiving and change addresses of each",
+                args.electrum_count
+            );
+        } else {
+            info!("Checking the master public key of each");
+        }
+    }
+
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total.min(u128::from(u64::MAX)) as u64);
+        pb.set_style(cli::default_progress_style_with_msg());
+        pb
+    };
+    let started = Instant::now();
+    let found = recover(
+        &pattern,
+        &targets,
+        args.electrum_count,
+        &mut stretcher,
+        |tested, rate| {
+            pb.set_position(tested.min(u128::from(u64::MAX)) as u64);
+            pb.set_message(format!("{rate:.0} seeds/s"));
+        },
+    )?;
+    pb.finish_and_clear();
+
+    let Some(found) = found else {
+        return Err(anyhow!(
+            "no seed matching the pattern has the given master public key, or the given address(es)/public key(s) among its first {} receiving/change addresses",
+            args.electrum_count
+        ));
+    };
+
+    let matched = match &found.matched {
+        MatchedKey::MasterPublicKey => "master public key".to_string(),
+        MatchedKey::Address {
+            address,
+            change,
+            index,
+        } => format!(
+            "{} ({} #{})",
+            address,
+            if *change { "change" } else { "receiving" },
+            index
+        ),
+    };
+
+    let report_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| ELECTRUM_REPORT_FILE.to_string());
+    let key_count = match found.matched {
+        MatchedKey::Address { index, .. } => args.electrum_count.max(index + 1),
+        MatchedKey::MasterPublicKey => args.electrum_count,
+    };
+    save_electrum_report(&report_path, &found.words, &matched, key_count)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&found)?);
+    } else if args.quiet {
+        println!("{}", found.words);
+    } else {
+        info!("Seed found in {:.1}s", started.elapsed().as_secs_f64());
+        println!("Seed words: {}", found.words);
+        println!("Seed (hex): {}", found.hex_seed);
+        println!("Matched:    {matched}");
+        println!("Seed and keys saved to {report_path}");
+    }
+    Ok(())
+}
+
+/// Default file for recovered seeds when `-o` is not given.
+const ELECTRUM_REPORT_FILE: &str = "electrum_recovered.txt";
+
+/// Append the recovered seed, its master public key and the first `count` receiving
+/// and change addresses with their private keys to `path`.
+///
+/// The file is created owner-read/write only, since it holds private keys, and is
+/// appended to so earlier results are never overwritten.
+fn save_electrum_report(path: &str, words: &str, matched: &str, count: u32) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    let wallet = electrum::OldElectrumWallet::from_seed(words)?;
+    let found_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+
+    let mut report = String::new();
+    writeln!(report, "=== Recovered old Electrum seed (unix time {found_at}) ===")?;
+    writeln!(report, "Seed words:        {words}")?;
+    writeln!(report, "Seed (hex):        {}", wallet.hex_seed())?;
+    writeln!(report, "Master public key: {}", wallet.master_public_key_hex())?;
+    writeln!(report, "Matched:           {matched}")?;
+    for change in [false, true] {
+        writeln!(report)?;
+        writeln!(
+            report,
+            "{:<10} {:>5}  {:<34}  {:<64}  WIF (uncompressed)",
+            "chain", "index", "address", "private key (hex)"
+        )?;
+        for derived in wallet.addresses(change, count)? {
+            writeln!(
+                report,
+                "{:<10} {:>5}  {:<34}  {}  {}",
+                if change { "change" } else { "receiving" },
+                derived.index,
+                derived.address,
+                derived.private_key_hex,
+                derived.wif
+            )?;
+        }
+    }
+    writeln!(report)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|e| anyhow!("cannot write recovered seed to {path}: {e}"))?;
+    file.write_all(report.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn print_gpu_list(devices: &[gpu_crypto::GpuDeviceInfo]) {
     if devices.is_empty() {
         println!("No GPU devices found.");
@@ -1007,6 +1273,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if args.list_providers {
         print_providers_list();
         return Ok(());
+    }
+
+    if let Some(ref seed) = args.electrum_seed {
+        return print_electrum_addresses(seed, args.electrum_count, args.json, args.quiet);
+    }
+
+    if let Some(ref pattern) = args.electrum_recover {
+        return run_electrum_recover(&args, pattern);
     }
 
     if args.benchmark {
@@ -1350,10 +1624,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut solvers = Vec::with_capacity(gpu_contexts.len());
     let mut kangaroo_offset = 0u32;
-    for ((gpu_index, ctx, _, _), per_gpu_k) in gpu_contexts
-        .into_iter()
-        .zip(per_gpu_k_allocation)
-    {
+    for ((gpu_index, ctx, _, _), per_gpu_k) in gpu_contexts.into_iter().zip(per_gpu_k_allocation) {
         let solver = solver::KangarooSolver::new_with_base_no_dp_table(
             ctx,
             solve_pubkey,
@@ -1707,6 +1978,35 @@ mod cli_tests {
                 range / 2 - dp.min(range / 2) <= 18,
                 "range {range}: dp {dp} would overflow the DP table"
             );
+        }
+    }
+
+    #[test]
+    fn test_save_electrum_report_appends_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("found.txt");
+        let path_str = path.to_str().unwrap();
+        let words =
+            "powerful random nobody notice nothing important anyway look away hidden message over";
+
+        save_electrum_report(path_str, words, "1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo (receiving #0)", 2)
+            .unwrap();
+        save_electrum_report(path_str, words, "master public key", 1).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("=== Recovered old Electrum seed").count(), 2);
+        assert!(text.contains(&format!("Seed words:        {words}")));
+        assert!(text.contains("Seed (hex):        acb740e454c3134901d7c8f16497cc1c"));
+        assert!(text.contains("Master public key: e9d4b7866dd1e91c"));
+        assert!(text.contains("receiving      0  1FJEEB8ihPMbzs2SkLmr37dHyRFzakqUmo"));
+        assert!(text.contains("change         0  1KRW8pH6HFHZh889VDq6fEKvmrsmApwNfe"));
+        assert!(text.contains("5JuecQZ1nH4VCQRQJTQjB4yu93BU6NmnAkDoGRdHX2PyH2E8QVX"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
         }
     }
 
